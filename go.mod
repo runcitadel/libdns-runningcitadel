@@ -1,4 +1,4 @@
-module github.com/libdns/cloudflare
+module github.com/runcitadel/libdns-runningcitadel
 
 go 1.18
 

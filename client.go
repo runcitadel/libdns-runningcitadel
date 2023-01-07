@@ -1,17 +1,17 @@
-package cloudflare
+package runningcitadel
 
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/url"
 
 	"github.com/libdns/libdns"
 )
 
-func (p *Provider) createRecord(ctx context.Context, zoneInfo cfZone, record libdns.Record) (cfDNSRecord, error) {
+func (p *Provider) createRecord(ctx context.Context, record libdns.Record) (cfDNSRecord, error) {
 	cfRec, err := cloudflareRecord(record)
 	if err != nil {
 		return cfDNSRecord{}, err
@@ -21,7 +21,7 @@ func (p *Provider) createRecord(ctx context.Context, zoneInfo cfZone, record lib
 		return cfDNSRecord{}, err
 	}
 
-	reqURL := fmt.Sprintf("%s/zones/%s/dns_records", baseURL, zoneInfo.ID)
+	reqURL := fmt.Sprintf("%s/api/dns/create", baseURL)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(jsonBytes))
 	if err != nil {
 		return cfDNSRecord{}, err
@@ -37,17 +37,16 @@ func (p *Provider) createRecord(ctx context.Context, zoneInfo cfZone, record lib
 	return result, nil
 }
 
-// updateRecord updates a DNS record. oldRec must have both an ID and zone ID.
+// updateRecord updates a DNS record. oldRec must have an ID.
 // Only the non-empty fields in newRec will be changed.
 func (p *Provider) updateRecord(ctx context.Context, oldRec, newRec cfDNSRecord) (cfDNSRecord, error) {
-	reqURL := fmt.Sprintf("%s/zones/%s/dns_records/%s", baseURL, oldRec.ZoneID, oldRec.ID)
+	reqURL := fmt.Sprintf("%s/api/dns/records/%s", baseURL, oldRec.ID)
 	jsonBytes, err := json.Marshal(newRec)
 	if err != nil {
 		return cfDNSRecord{}, err
 	}
 
-	// PATCH changes only the populated fields; PUT resets Type, Name, Content, and TTL even if empty
-	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, reqURL, bytes.NewReader(jsonBytes))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, reqURL, bytes.NewReader(jsonBytes))
 	if err != nil {
 		return cfDNSRecord{}, err
 	}
@@ -58,15 +57,27 @@ func (p *Provider) updateRecord(ctx context.Context, oldRec, newRec cfDNSRecord)
 	return result, err
 }
 
-func (p *Provider) getDNSRecords(ctx context.Context, zoneInfo cfZone, rec libdns.Record, matchContent bool) ([]cfDNSRecord, error) {
-	qs := make(url.Values)
-	qs.Set("type", rec.Type)
-	qs.Set("name", libdns.AbsoluteName(rec.Name, zoneInfo.Name))
+type FindOptions struct {
+	Match     string `json:"match,omitempty"`
+	Name      string `json:"name"`
+	Order     string `json:"order,omitempty"`
+	PerPage   int    `json:"perPage,omitempty"`
+	Content   string `json:"content,omitempty"`
+	Type      string `json:"type,omitempty"`
+	Direction string `json:"direction,omitempty"`
+}
+
+func (p *Provider) getDNSRecords(ctx context.Context, zone string, rec libdns.Record, matchContent bool) ([]cfDNSRecord, error) {
+	query := FindOptions{
+		Name:    rec.Name,
+		Type:    rec.Type,
+		PerPage: 100,
+	}
 	if matchContent {
-		qs.Set("content", rec.Value)
+		query.Content = rec.Value
 	}
 
-	reqURL := fmt.Sprintf("%s/zones/%s/dns_records?%s", baseURL, zoneInfo.ID, qs.Encode())
+	reqURL := fmt.Sprintf("%s/api/dns/find", baseURL)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, err
@@ -77,78 +88,32 @@ func (p *Provider) getDNSRecords(ctx context.Context, zoneInfo cfZone, rec libdn
 	return results, err
 }
 
-func (p *Provider) getZoneInfo(ctx context.Context, zoneName string) (cfZone, error) {
-	p.zonesMu.Lock()
-	defer p.zonesMu.Unlock()
-
-	// if we already got the zone info, reuse it
-	if p.zones == nil {
-		p.zones = make(map[string]cfZone)
-	}
-	if zone, ok := p.zones[zoneName]; ok {
-		return zone, nil
-	}
-
-	qs := make(url.Values)
-	qs.Set("name", zoneName)
-	reqURL := fmt.Sprintf("%s/zones?%s", baseURL, qs.Encode())
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
-	if err != nil {
-		return cfZone{}, err
-	}
-
-	var zones []cfZone
-	_, err = p.doAPIRequest(req, &zones)
-	if err != nil {
-		return cfZone{}, err
-	}
-	if len(zones) != 1 {
-		return cfZone{}, fmt.Errorf("expected 1 zone, got %d for %s", len(zones), zoneName)
-	}
-
-	// cache this zone for possible reuse
-	p.zones[zoneName] = zones[0]
-
-	return zones[0], nil
-}
-
 // doAPIRequest authenticates the request req and does the round trip. It returns
 // the decoded response from Cloudflare if successful; otherwise it returns an
 // error including error information from the API if applicable. If result is a
 // non-nil pointer, the result field from the API response will be decoded into
 // it for convenience.
-func (p *Provider) doAPIRequest(req *http.Request, result interface{}) (cfResponse, error) {
-	req.Header.Set("Authorization", "Bearer "+p.APIToken)
+func (p *Provider) doAPIRequest(req *http.Request, result interface{}) (json.RawMessage, error) {
+	req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(p.Username+":"+p.Password)))
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return cfResponse{}, err
+		return json.RawMessage{}, err
 	}
 	defer resp.Body.Close()
 
-	var respData cfResponse
+	// Fail if status is not 2xx
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return json.RawMessage{}, fmt.Errorf("got error status: HTTP %d", resp.StatusCode)
+	}
+
+	var respData json.RawMessage
 	err = json.NewDecoder(resp.Body).Decode(&respData)
 	if err != nil {
-		return cfResponse{}, err
-	}
-
-	if resp.StatusCode >= 400 {
-		return cfResponse{}, fmt.Errorf("got error status: HTTP %d: %+v", resp.StatusCode, respData.Errors)
-	}
-	if len(respData.Errors) > 0 {
-		return cfResponse{}, fmt.Errorf("got errors: HTTP %d: %+v", resp.StatusCode, respData.Errors)
-	}
-
-	if len(respData.Result) > 0 && result != nil {
-		err = json.Unmarshal(respData.Result, result)
-		if err != nil {
-			return cfResponse{}, err
-		}
-		respData.Result = nil
+		return json.RawMessage{}, err
 	}
 
 	return respData, err
 }
 
-const baseURL = "https://api.cloudflare.com/client/v4"
+const baseURL = "https://runningcitadel.com"
